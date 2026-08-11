@@ -1,5 +1,25 @@
 .vscode
 
+# Virtual environments
+venv/
+env/
+ENV/
+
+# LoRA & Training Artifacts
+chatterbox_lora_best/
+chatterbox_lora_final/
+checkpoints/
+
+# Generated audio files
+*.wav
+*.mp3
+
+# Training logs
+*.log
+train.log
+inference.log
+
+
 # Pylance
 pyrightconfig.json
 
