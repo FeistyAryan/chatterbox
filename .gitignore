@@ -64,5 +64,10 @@ syn_out/
 checkpoints/
 .gradio
 
+# Derived training artifacts (rebuilt automatically on the next run)
+token_cache.pt
+**/token_cache.pt
+**/run_config.json
+
 # Ignore generated sample .wav files
 **/*.wav
