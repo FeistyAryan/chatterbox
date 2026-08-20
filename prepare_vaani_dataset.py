@@ -26,8 +26,11 @@ import numpy as np
 import pyarrow.parquet as pq
 import soundfile as sf
 
-DEFAULT_SRC = Path("/home/aryan/Desktop/vaani_hindi_dataset/hindi")
-DEFAULT_OUT = Path("/home/aryan/Desktop/vaani_hindi_dataset/prepared")
+# --src must be pointed at wherever the Vaani parquet shards live; only the
+# output default is repo-relative.
+REPO_ROOT = Path(__file__).resolve().parent
+DEFAULT_SRC = Path("vaani_hindi_dataset/hindi")
+DEFAULT_OUT = REPO_ROOT / "data" / "vaani_hindi"
 
 TAG_RE = re.compile(r"<[^>]*>|\[[^\]]*\]")
 DEVA = lambda c: "ऀ" <= c <= "ॿ"

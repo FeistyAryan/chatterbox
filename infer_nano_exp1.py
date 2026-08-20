@@ -15,8 +15,8 @@ from peft import PeftModel
 from chatterbox.tts_turbo import ChatterboxTurboTTS, punc_norm
 from chatterbox.models.s3gen.const import S3GEN_SIL
 
-DEFAULT_REFERENCE_AUDIO = Path(
-    "/home/aryan/Desktop/yt_scraper/output/fbWf6HjaNiA/segments_aligned/000030/final.wav"
+DEFAULT_REFERENCE_AUDIO = (
+    Path(__file__).resolve().parent / "data" / "vaani_hindi" / "wavs" / "000000.wav"
 )
 S3_EOS = 6561
 

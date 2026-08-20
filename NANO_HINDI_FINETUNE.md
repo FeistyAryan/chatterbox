@@ -13,6 +13,88 @@ cross-lingual cloning from an English reference (measured below).
 
 ---
 
+## Start here
+
+**Goal:** the smallest usable Hindi TTS model. Voice cloning is a nice-to-have that came
+along for free; TTS quality is the objective.
+
+**Where it stands.** Three runs so far — a 24-minute single-speaker pilot (overfit,
+unintelligible), a 20 h LoRA run (**first run where val loss actually fell**; audio is
+clearly Hindi-shaped and hits EOS, not yet fluent), and next the full 166.77 h corpus with
+a full fine-tune. The 20 h run plateaued with train loss still falling while val turned up,
+which means it was **data-limited, not step-limited** — hence the jump to the full corpus
+rather than more epochs.
+
+**Next action:** run the full-corpus training on a 24 GB card (command under *Train*),
+starting with `--dry-run` to confirm the batch size fits.
+
+**Deployable artifact today:** `experiments/vaani_20h/checkpoints/best`.
+
+### Architecture — what is actually being trained
+
+Nano is three chained networks. **Only T3 is fine-tuned.**
+
+```
+Hindi text --> [T3] --> speech tokens --> [S3Gen] --> waveform
+                 ^
+          speaker embedding
+                 ^
+         [VoiceEncoder] <-- reference audio
+```
+
+| Network | Params | Job | Status |
+| --- | --- | --- | --- |
+| **T3** | 178.86M | text → speech tokens | **trained** |
+| S3Gen | 266.03M | speech tokens → audio | frozen |
+| VoiceEncoder | 1.42M | audio → 256-d voice vector | frozen |
+| **Total** | **446.31M** | | |
+
+Inside T3: `tfmr` (91.35M, a GPT-2 small backbone), `text_emb` (38.61M, trained),
+`text_head` (38.61M, frozen), `speech_emb`/`speech_head` (~5M each), `cond_enc` (0.20M).
+Full mode trains 140.25M of these; LoRA r=32 trains 43.33M.
+
+**This split localises every bug.** Distorted or robotic audio points at S3Gen — which is
+frozen, so it is almost never the cause. Wrong *words* point at T3. `codec_roundtrip_test.py`
+exists to separate the two definitively.
+
+### Two token spaces
+
+- **Text** — GPT-2 BPE, vocab 50,276. Devanagari has no learned merges, so it falls through
+  to byte-fallback: ~1.5 tokens/char. Lossless, just inefficient. Only 3,023 ids are used.
+- **Speech** — S3 codec, ids `[0, 6561)` + BOS 6561 + EOS 6562, at **25 tokens/sec**.
+
+### Environment
+
+```bash
+python -m venv venv && source venv/bin/activate
+pip install -e .
+pip install peft pyarrow soundfile librosa
+```
+
+Base weights download from HuggingFace on first `ChatterboxTurboTTS.from_pretrained(nano=True)`.
+Training needs `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` to limit fragmentation.
+
+### Moving the data to a training box
+
+`data/vaani_hindi/` is 19 GB and gitignored — it is **not** in the repo and has to be
+shipped separately:
+
+```bash
+rsync -avP --info=progress2 data/vaani_hindi/ user@gpu-box:/path/to/chatterbox/data/vaani_hindi/
+```
+
+Or re-extract it there from the parquet shards, which is reproducible and often faster than
+copying 82k small files:
+
+```bash
+python prepare_vaani_dataset.py --keep-all --target-hours 1000 \
+  --src /path/to/vaani/hindi --out data/vaani_hindi
+```
+
+Manifest paths are absolute, so re-extracting on the target box is the safer option.
+
+---
+
 ## Non-obvious things a reviewer should know
 
 Each of these silently produces a broken-but-still-training model. They are the
@@ -86,20 +168,23 @@ of 734 tokens (vs 485). That difference is what caused an OOM 1250 steps into a 
 
 ---
 
-## Setup
-
-```bash
-source venv/bin/activate
-```
-
 ## Verify before training — always
 
+All path defaults are repo-relative and point at `data/vaani_hindi/`, so with the dataset
+extracted there this needs no arguments at all:
+
 ```bash
-python train_nano_exp1.py --dry-run --manifest data/vaani_hindi/manifest.txt --multi-speaker
+python train_nano_exp1.py --dry-run --multi-speaker
 ```
 
 Runs one batch and asserts the loss is finite, gradients are finite, and only the intended
 parameters are trainable.
+
+> **Budget ~90 minutes the first time.** The dry run must build the full 82k-clip token
+> cache before it can do anything, because selecting the worst-case batch requires knowing
+> every clip's length. This is **not** wasted: the cache is written to
+> `<output-dir>/token_cache.pt` and the real training run reuses it and starts immediately.
+> Point `--output-dir` at the same directory for both.
 
 **The dry run deliberately builds the worst-case batch** — the `--batch-size` longest clips
 in the split, not a random one. Peak memory is set by the longest batch, and benchmarking
@@ -360,6 +445,62 @@ scale with batch × sequence length.
 **Do not extrapolate these to the 4090 — run `--dry-run` there and read the printed peak.**
 
 ---
+
+## Debug playbook
+
+| Symptom | Check first |
+| --- | --- |
+| CUDA OOM mid-run | The **full** `nvidia-smi` table, not `--query-compute-apps` — that omits graphics contexts. A desktop/IDE/game can silently hold 300+ MB. |
+| `CUBLAS_STATUS_ALLOC_FAILED` | Also out of memory, but a plain `RuntimeError`, so the OOM guard cannot catch it. Reduce batch size. |
+| "gradients non-finite" in dry run | Only possible in fp16. The dry run re-checks in fp32; if that passes it is normal GradScaler calibration, not breakage. bf16 avoids this entirely. |
+| Output is gibberish | Compare val speech loss to 8.79. Is val *falling* or rising? Rising from epoch 1 = too little data. |
+| Generation never stops | Check the EOS-hit line from `infer_nano_exp1.py`. Undertrained models run to the cap. |
+| Cloned voice sounds generic | Was `--multi-speaker` passed at **both** train and inference? They must match. |
+| Speaker cosine ≈ 0.999 for everything | You built a bare `VoiceEncoder()`. Use the pretrained `model.ve`. |
+| Resume appears to do nothing | `--max-epochs` is absolute, not "how many more". |
+| Token cache rebuilding unexpectedly | Row count **and** the `multi_speaker` flag must both match the cached values. |
+| Loss looks great but audio is garbage | Suspect an unshifted loss. Confirm `shifted_masked_ce` is in use, not `T3.loss()`. |
+
+## Questions a new owner will ask
+
+**Why LoRA originally, and why drop it?** LoRA was a 4 GB-card constraint — a full
+fine-tune needs ~2.4 GB of weights/grads/optimizer state before any activations. On 24 GB
+that constraint is gone, so full fine-tuning is the default. LoRA is kept as a fallback and
+because the existing 20 h checkpoint is a LoRA adapter.
+
+**Is conditioning on the target clip's own speaker embedding leakage?** No. It is a 256-d
+identity vector — timbre, pitch range, vocal tract — and cannot encode *which words* to
+say. The thing that would leak is the 375-token speech cond prompt, which is raw codec
+tokens of the answer; that is exactly why it is disabled. See *Multi-speaker conditioning*.
+
+**Is val speech loss 4.9685 good?** Against a random baseline of 8.79, yes; converged, no.
+`exp(4.9685) ≈ 144` effective choices per step out of 6,563. The 20 h run proved the
+direction is right, not that the model is finished.
+
+**Why keep `<noise>` in the transcripts?** They are acoustic-event conditioning labels, not
+words. See *`--keep-all` keeps the transcripts verbatim*.
+
+**Why is `text_head` frozen even in "full" mode?** It only feeds the auxiliary text loss
+(weight 0.2), so its 38.6M params buy little. `--train-text-head` enables it.
+
+**What is the biggest remaining size win?** Vocab pruning — see below.
+
+## Change history worth knowing
+
+Two bugs were found and fixed while preparing the 4090 run; both are the kind that do not
+announce themselves:
+
+1. **The OOM guard wrapped only the forward pass.** Peak memory lands during *backward*, so
+   an oversized batch still killed the run. Now both are guarded, and the gradient
+   accumulation window is zeroed on a skip — a half-finished backward leaves gradients for
+   only part of a batch, and stepping on those silently applies a mis-scaled update.
+2. **`text_emb` ran at lr 1e-4 against a 2e-5 backbone** once full mode became the default,
+   letting embeddings drift five times faster than the layers reading them could adapt.
+   That default was correct for LoRA (frozen backbone) and wrong for a full fine-tune;
+   `--emb-lr` now resolves from the train mode.
+
+Earlier, the resume path saved train/val split indices but never restored them, so a grown
+manifest would reshuffle `randperm()` and leak held-out rows into train.
 
 ## Things ruled out (don't re-litigate)
 

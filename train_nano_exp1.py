@@ -56,11 +56,13 @@ from chatterbox.models.t3.modules.cond_enc import T3Cond
 t3_module._ensure_BOT_EOT = lambda text_tokens, hp: None
 
 
-DEFAULT_MANIFEST = Path("/home/aryan/Desktop/yt_scraper/dataset_final.manifest.txt")
-DEFAULT_REFERENCE_AUDIO = Path(
-    "/home/aryan/Desktop/yt_scraper/output/fbWf6HjaNiA/segments_aligned/000030/final.wav"
-)
-DEFAULT_OUTPUT_DIR = Path("experiments/nano_exp1")
+# Repo-relative so the scripts work on any machine. `data/` is gitignored and
+# populated by prepare_vaani_dataset.py -- see NANO_HINDI_FINETUNE.md.
+REPO_ROOT = Path(__file__).resolve().parent
+DEFAULT_DATA_DIR = REPO_ROOT / "data" / "vaani_hindi"
+DEFAULT_MANIFEST = DEFAULT_DATA_DIR / "manifest.txt"
+DEFAULT_REFERENCE_AUDIO = DEFAULT_DATA_DIR / "wavs" / "000000.wav"
+DEFAULT_OUTPUT_DIR = REPO_ROOT / "experiments" / "vaani_full"
 IGNORE_ID = -100
 TARGET_SR = 16000
 TEXT_PAD = 0  # masked out by lengths, value irrelevant
