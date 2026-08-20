@@ -35,12 +35,13 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 import torchaudio as ta
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset, Sampler, Subset
 
 try:
-    from transformers import get_linear_schedule_with_warmup
+    from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
 except Exception:  # pragma: no cover - optional scheduler path
     get_linear_schedule_with_warmup = None
+    get_cosine_schedule_with_warmup = None
 
 from peft import LoraConfig, PeftModel, get_peft_model
 
@@ -72,6 +73,62 @@ FIXED_EVAL_PROMPTS = [
     "कृपया साफ़ और धीरे बोलिए।",
     "यह प्रयोग हिंदी आवाज़ सुधारने के लिए है।",
 ]
+
+
+def resolve_amp_dtype(choice: str, device: torch.device):
+    """Autocast dtype, or None for full fp32.
+
+    bf16 is preferred wherever the hardware has it: it carries fp32's exponent
+    range, so it needs no GradScaler and cannot overflow the way fp16 did at
+    lora_r=64. fp16 remains the fallback for pre-Ampere cards.
+    """
+    if device.type != "cuda" or choice == "fp32":
+        return None
+    if choice == "auto":
+        choice = "bf16" if torch.cuda.is_bf16_supported() else "fp16"
+    return torch.bfloat16 if choice == "bf16" else torch.float16
+
+
+class LengthBucketSampler(Sampler):
+    """Yield batches whose members have similar sequence lengths.
+
+    Every batch is padded to its longest member, so pairing a 50-token clip with
+    an 1100-token one throws away most of the compute on padding. Vaani clip
+    lengths span roughly that whole range, so with batch_size>1 this is the
+    difference between a fast epoch and a mostly-idle one.
+
+    Shuffle globally, cut into chunks of `bucket_size` batches, sort each chunk
+    by length, then shuffle the emitted batch order. Randomness is preserved at
+    the batch level; only the *composition* of a batch is length-biased.
+    """
+
+    def __init__(self, lengths, batch_size, shuffle=True, bucket_size=50, seed=0):
+        self.lengths = list(lengths)
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.chunk = batch_size * bucket_size
+        self.seed = seed
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int):
+        self.epoch = epoch
+
+    def __len__(self):
+        return math.ceil(len(self.lengths) / self.batch_size)
+
+    def __iter__(self):
+        idx = list(range(len(self.lengths)))
+        if self.shuffle:
+            rng = random.Random(self.seed + self.epoch)
+            rng.shuffle(idx)
+        batches = []
+        for start in range(0, len(idx), self.chunk):
+            chunk = sorted(idx[start:start + self.chunk], key=lambda i: self.lengths[i])
+            batches.extend(chunk[i:i + self.batch_size]
+                           for i in range(0, len(chunk), self.batch_size))
+        if self.shuffle:
+            random.Random(self.seed + self.epoch + 1).shuffle(batches)
+        return iter(batches)
 
 
 @dataclass
@@ -128,7 +185,7 @@ def to_mono_resampled(wav: torch.Tensor, sr: int, target_sr: int = TARGET_SR) ->
 # ---------------------------------------------------------------------------
 
 def build_or_load_token_cache(cache_path: Path, rows: list[tuple[Path, str]], model: ChatterboxTurboTTS,
-                              multi_speaker: bool = False):
+                              multi_speaker: bool = False, cache_device: str = "cpu"):
     """Tokenize the whole manifest once (text + S3 speech tokens) and cache to disk.
 
     In multi-speaker mode a voice-encoder embedding is also computed per clip, so
@@ -143,7 +200,14 @@ def build_or_load_token_cache(cache_path: Path, rows: list[tuple[Path, str]], mo
 
     hp = model.t3.hp
     items = []
-    print(f"Building token cache for {len(rows)} rows (one-time, uses CPU S3 tokenizer)...")
+    # The S3 tokenizer and voice encoder are the slow part (~0.235 s/clip on CPU).
+    # At 82k clips that is over five hours, so run them on the GPU when there is
+    # one; both are small and the training model is not resident yet.
+    dev = torch.device(cache_device)
+    model.s3gen.tokenizer.to(dev)
+    if multi_speaker:
+        model.ve.to(dev)
+    print(f"Building token cache for {len(rows)} rows (one-time, S3 tokenizer on {dev})...")
     start = time.perf_counter()
     for idx, (audio_path, transcript) in enumerate(rows):
         if not audio_path.exists():
@@ -164,8 +228,8 @@ def build_or_load_token_cache(cache_path: Path, rows: list[tuple[Path, str]], mo
         wav, sr = ta.load(str(audio_path))
         wav = to_mono_resampled(wav, sr, TARGET_SR)
         with torch.no_grad():
-            speech_tokens, _ = model.s3gen.tokenizer.forward([wav], max_len=None)
-        speech_tokens = speech_tokens.squeeze(0).to(torch.long)
+            speech_tokens, _ = model.s3gen.tokenizer.forward([wav.to(dev)], max_len=None)
+        speech_tokens = speech_tokens.squeeze(0).to("cpu", torch.long)
         if int(speech_tokens.min()) < 0 or int(speech_tokens.max()) >= S3_EOS:
             raise ValueError(f"Row {idx}: speech token id out of codec bounds.")
         speech_tokens = torch.cat([
@@ -188,10 +252,18 @@ def build_or_load_token_cache(cache_path: Path, rows: list[tuple[Path, str]], mo
             # safe -- unlike a speech cond prompt, which would leak the answer.
             with torch.no_grad():
                 ve_embed = model.ve.embeds_from_wavs([wav.squeeze(0).numpy()], sample_rate=TARGET_SR)
-            item["speaker_emb"] = torch.from_numpy(ve_embed).float().mean(dim=0)
+            item["speaker_emb"] = torch.from_numpy(ve_embed).float().mean(dim=0).cpu()
         items.append(item)
-        if (idx + 1) % 50 == 0 or (idx + 1) == len(rows):
-            print(f"  tokenized {idx + 1}/{len(rows)}")
+        if (idx + 1) % 500 == 0 or (idx + 1) == len(rows):
+            rate = (idx + 1) / (time.perf_counter() - start)
+            eta = (len(rows) - idx - 1) / max(rate, 1e-6)
+            print(f"  tokenized {idx + 1}/{len(rows)}  ({rate:.1f} clips/s, ETA {eta/60:.1f} min)")
+
+    model.s3gen.tokenizer.to("cpu")
+    if multi_speaker:
+        model.ve.to("cpu")
+    if dev.type == "cuda":
+        torch.cuda.empty_cache()
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"num_rows": len(rows), "items": items, "multi_speaker": multi_speaker}, cache_path)
@@ -284,7 +356,10 @@ def build_nano_model(args, device: torch.device) -> ChatterboxTurboTTS:
         # stays frozen: it only serves the auxiliary text loss.
         for param in model.t3.parameters():
             param.requires_grad = True
-        freeze_module(model.t3.text_head)
+        if not args.train_text_head:
+            # text_head only feeds the auxiliary text loss (weight 0.2), so
+            # training its 38.6M params buys little. Opt in explicitly.
+            freeze_module(model.t3.text_head)
         freeze_module(model.t3.tfmr.wte)  # stub
         if args.resume_from:
             state_path = Path(args.resume_from) / "t3_state.pt"
@@ -337,8 +412,9 @@ def check_sanity(model: ChatterboxTurboTTS, args):
         raise RuntimeError("S3Gen parameters are not frozen.")
     if any(p.requires_grad for p in model.ve.parameters()):
         raise RuntimeError("Voice encoder parameters are not frozen.")
-    if any(p.requires_grad for p in model.t3.text_head.parameters()):
-        raise RuntimeError("text_head parameters are not frozen.")
+    if not getattr(args, "train_text_head", False):
+        if any(p.requires_grad for p in model.t3.text_head.parameters()):
+            raise RuntimeError("text_head parameters are not frozen.")
 
     total = sum(p.numel() for _, p in trainable)
     print(f"Sanity check passed. Trainable params: {total:,}")
@@ -400,6 +476,21 @@ def compute_batch_losses(model: ChatterboxTurboTTS, batch, t3_cond, text_loss_we
 
 def move_batch_to_device(batch, device: torch.device):
     return {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
+
+
+def clip_gradients(model: ChatterboxTurboTTS, max_grad_norm: float) -> None:
+    """Clip the global gradient norm.
+
+    LoRA is intrinsically constrained by its low rank, so this rarely mattered
+    before. A full fine-tune of 178M params has no such guardrail: one outlier
+    batch can produce a gradient large enough to wreck the weights in a single
+    step, and the damage does not show up until val loss jumps an epoch later.
+    """
+    if not max_grad_norm or max_grad_norm <= 0:
+        return
+    params = [p for p in model.t3.parameters() if p.requires_grad and p.grad is not None]
+    if params:
+        torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
 
 
 def grad_finite_check(model: ChatterboxTurboTTS) -> tuple[int, bool]:
@@ -536,9 +627,10 @@ def maybe_generate_samples(model, reference_cond, output_dir: Path, device: torc
 # Train / eval loops
 # ---------------------------------------------------------------------------
 
-def run_epoch(model, loader, optimizer, scaler, device, t3_cond, grad_accum_steps, train, scheduler, text_loss_weight):
-    is_cuda = device.type == "cuda"
-    autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.float16) if is_cuda else nullcontext()
+def run_epoch(model, loader, optimizer, scaler, device, t3_cond, grad_accum_steps, train, scheduler,
+              text_loss_weight, amp_dtype=None, max_grad_norm=0.0):
+    autocast_ctx = (torch.autocast(device_type="cuda", dtype=amp_dtype)
+                    if amp_dtype is not None else nullcontext())
     grad_ctx = torch.enable_grad() if train else torch.inference_mode()
 
     total_text = total_speech = total_loss = 0.0
@@ -561,15 +653,29 @@ def run_epoch(model, loader, optimizer, scaler, device, t3_cond, grad_accum_step
                 with autocast_ctx:
                     loss_text, loss_speech, loss_total = compute_batch_losses(model, batch, t3_cond, text_loss_weight)
                     scaled_loss = loss_total / grad_accum_steps if train else loss_total
+            # backward() must be inside the guard too: peak memory lands during
+            # the backward pass, not the forward, so that is where an oversized
+            # batch actually dies.
+            if train:
+                if scaler is not None:
+                    scaler.scale(scaled_loss).backward()
+                else:
+                    scaled_loss.backward()
         except torch.cuda.OutOfMemoryError:
             # A single unlucky long sequence must not kill a multi-hour run.
-            # Drop this batch, reclaim its memory, and carry on. Accumulated
-            # gradients from earlier micro-batches stay valid.
             oom_skipped += 1
             print(f"  CUDA OOM on batch {step_idx + 1} -- skipping it "
                   f"(seq len {int(batch['speech_tokens'].size(1))}+{int(batch['text_tokens'].size(1))}). "
                   f"total skipped: {oom_skipped}")
-            del batch
+            # A half-finished backward leaves the accumulation window holding
+            # gradients for only part of the batch. Stepping on those would apply
+            # a silently mis-scaled update, so discard the window and restart it.
+            if train:
+                optimizer.zero_grad(set_to_none=True)
+            # Drop every reference to the partial graph BEFORE empty_cache(),
+            # otherwise the tensors are still live and nothing is reclaimed.
+            batch = None
+            loss_text = loss_speech = loss_total = scaled_loss = None
             if device.type == "cuda":
                 torch.cuda.empty_cache()
             continue
@@ -580,26 +686,25 @@ def run_epoch(model, loader, optimizer, scaler, device, t3_cond, grad_accum_step
         batch_count += 1
 
         if train:
-            if scaler is not None:
-                scaler.scale(scaled_loss).backward()
-            else:
-                scaled_loss.backward()
-
             should_step = ((step_idx + 1) % grad_accum_steps == 0) or ((step_idx + 1) == len(loader))
             if should_step:
                 if scaler is not None:
+                    # Gradients must be unscaled before they can be clipped or
+                    # inspected -- otherwise the norm is off by the loss scale.
                     scaler.unscale_(optimizer)
-                    # With AMP, fp16 overflow steps are expected occasionally;
-                    # let GradScaler skip them instead of crashing.
+                    # With fp16, overflow steps are expected occasionally; let
+                    # GradScaler skip them instead of crashing.
                     grad_params, grads_finite = grad_finite_check(model)
                     if grad_params == 0:
                         raise RuntimeError("No gradients found before optimizer step.")
+                    clip_gradients(model, max_grad_norm)
                     scaler.step(optimizer)
                     scaler.update()
                 else:
                     grad_params, grads_finite = grad_finite_check(model)
                     if not grads_finite:
                         raise RuntimeError("Non-finite or missing gradients detected before optimizer step.")
+                    clip_gradients(model, max_grad_norm)
                     optimizer.step()
 
                 if scheduler is not None:
@@ -620,12 +725,15 @@ def run_epoch(model, loader, optimizer, scaler, device, t3_cond, grad_accum_step
 def build_scheduler(args, optimizer, steps_per_epoch: int):
     if args.scheduler == "none":
         return None
-    if args.scheduler == "linear":
-        if get_linear_schedule_with_warmup is None:
-            raise RuntimeError("Linear scheduler requested, but transformers scheduler utility is unavailable.")
-        total_steps = max(1, steps_per_epoch * args.max_epochs)
-        return get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=total_steps)
-    raise ValueError(f"Unsupported scheduler: {args.scheduler}")
+    builder = {"linear": get_linear_schedule_with_warmup,
+               "cosine": get_cosine_schedule_with_warmup}.get(args.scheduler)
+    if builder is None:
+        raise RuntimeError(f"{args.scheduler} scheduler requested, but the transformers "
+                           "scheduler utility is unavailable.")
+    total_steps = max(1, steps_per_epoch * args.max_epochs)
+    warmup = min(args.warmup_steps, max(0, total_steps - 1))
+    print(f"Scheduler: {args.scheduler}, {warmup} warmup / {total_steps} total optimizer steps")
+    return builder(optimizer, num_warmup_steps=warmup, num_training_steps=total_steps)
 
 
 def log_epoch_summary(prefix: str, metrics: dict):
@@ -643,22 +751,46 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--split-seed", type=int, default=42)
     parser.add_argument("--val-ratio", type=float, default=0.1)
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--grad-accum-steps", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=8,
+                        help="Tuned for 24GB. Use 1 with --grad-accum-steps 8 on a 4GB card. "
+                             "Confirm with --dry-run, which measures the worst-case batch.")
+    parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--max-epochs", type=int, default=None, help="Required for actual training runs.")
-    parser.add_argument("--train-mode", choices=["lora", "full"], default="lora")
-    parser.add_argument("--lr", type=float, default=2e-4, help="LoRA lr (use ~2e-5 for --train-mode full).")
-    parser.add_argument("--emb-lr", type=float, default=1e-4, help="text_emb learning rate (lora mode).")
+    parser.add_argument("--train-mode", choices=["lora", "full"], default="full",
+                        help="'full' trains all of T3. 'lora' is the low-VRAM fallback.")
+    parser.add_argument("--lr", type=float, default=None,
+                        help="Defaults to 2e-5 for --train-mode full, 2e-4 for lora.")
+    parser.add_argument("--emb-lr", type=float, default=None,
+                        help="text_emb learning rate. Defaults to --lr in full mode (uniform, the "
+                             "standard choice) and 1e-4 in lora mode, where the backbone is frozen "
+                             "and the embedding is one of only two things learning.")
     parser.add_argument("--text-loss-weight", type=float, default=0.2)
-    parser.add_argument("--scheduler", choices=["none", "linear"], default="none")
-    parser.add_argument("--warmup-steps", type=int, default=0)
+    parser.add_argument("--scheduler", choices=["none", "linear", "cosine"], default="cosine",
+                        help="A full fine-tune is unstable at a flat LR; cosine + warmup is the safe "
+                             "default.")
+    parser.add_argument("--warmup-steps", type=int, default=500)
     parser.add_argument("--early-stop-patience", type=int, default=5)
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--mixed-precision", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=False,
+                        help="Trades ~30%% speed for a large activation-memory saving. Off for 24GB; "
+                             "turn it ON for a 4GB card.")
+    parser.add_argument("--precision", choices=["auto", "bf16", "fp16", "fp32"], default="auto",
+                        help="auto picks bf16 where supported. bf16 has fp32's exponent range, so it "
+                             "needs no GradScaler and cannot overflow the way fp16 does.")
+    parser.add_argument("--max-grad-norm", type=float, default=1.0,
+                        help="Gradient clipping. Matters far more for a full fine-tune than for LoRA; "
+                             "0 disables.")
+    parser.add_argument("--length-bucketing", action=argparse.BooleanOptionalAction, default=True,
+                        help="Batch clips of similar length together so padding does not dominate "
+                             "compute. Only meaningful when --batch-size > 1.")
+    parser.add_argument("--cache-device", choices=["auto", "cuda", "cpu"], default="auto",
+                        help="Device for the one-time token-cache build. GPU is ~8x faster.")
     parser.add_argument("--generate-audio", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--generate-every", type=int, default=1, help="Generate eval samples every N epochs.")
     parser.add_argument("--train-text-emb", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--train-text-head", action=argparse.BooleanOptionalAction, default=False,
+                        help="Also train text_head (38.6M params). It only feeds the auxiliary text "
+                             "loss, so this buys little; off by default even in full mode.")
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
@@ -685,10 +817,27 @@ def main():
         args.token_cache = args.output_dir / "token_cache.pt"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    use_amp = device.type == "cuda" and args.mixed_precision
+    amp_dtype = resolve_amp_dtype(args.precision, device)
+    use_amp = amp_dtype is not None
+    # Only fp16 needs loss scaling; bf16 spans the same exponent range as fp32.
+    needs_scaler = amp_dtype == torch.float16
 
-    print(f"Device: {device}")
-    print(f"AMP enabled: {use_amp}")
+    if args.lr is None:
+        args.lr = 2e-5 if args.train_mode == "full" else 2e-4
+        print(f"--lr not given; using {args.lr} for --train-mode {args.train_mode}")
+    if args.emb_lr is None:
+        # In full mode everything trains together, so a text_emb LR several times
+        # the backbone's would let the embeddings drift faster than the layers
+        # reading them can adapt.
+        args.emb_lr = args.lr if args.train_mode == "full" else 1e-4
+        print(f"--emb-lr not given; using {args.emb_lr} for --train-mode {args.train_mode}")
+
+    print(f"Device: {device}"
+          + (f" ({torch.cuda.get_device_name(0)}, "
+             f"{torch.cuda.get_device_properties(0).total_memory / 1024**3:.0f}GB)"
+             if device.type == "cuda" else ""))
+    print(f"Precision: {str(amp_dtype).replace('torch.', '') if use_amp else 'fp32'}"
+          f" (GradScaler: {needs_scaler})")
     print(f"Train mode: {args.train_mode}")
     print(f"Manifest: {args.manifest}")
     print(f"Output dir: {args.output_dir}")
@@ -743,7 +892,12 @@ def main():
     model = build_nano_model(args, device)
     trainable_count = check_sanity(model, args)
 
-    items = build_or_load_token_cache(args.token_cache, rows, model, multi_speaker=args.multi_speaker)
+    cache_device = args.cache_device
+    if cache_device == "auto":
+        cache_device = "cuda" if torch.cuda.is_available() else "cpu"
+    items = build_or_load_token_cache(args.token_cache, rows, model,
+                                      multi_speaker=args.multi_speaker,
+                                      cache_device=cache_device)
 
     # Report which text token ids the dataset actually uses.
     used_ids = set()
@@ -769,28 +923,40 @@ def main():
     gc.collect()
 
     dataset = CachedTokenDataset(items)
-    train_loader = DataLoader(
-        Subset(dataset, train_indices),
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        collate_fn=collate_batch,
-        pin_memory=(args.pin_memory and device.type == "cuda"),
-    )
-    val_loader = DataLoader(
-        Subset(dataset, val_indices),
-        batch_size=args.batch_size,
-        shuffle=False,
+    train_subset = Subset(dataset, train_indices)
+    val_subset = Subset(dataset, val_indices)
+    loader_kwargs = dict(
         num_workers=args.num_workers,
         collate_fn=collate_batch,
         pin_memory=(args.pin_memory and device.type == "cuda"),
     )
 
+    # Total sequence length drives both memory and compute, so bucket on it.
+    train_sampler = val_sampler = None
+    if args.length_bucketing and args.batch_size > 1:
+        train_lens = [items[i]["speech_tokens"].numel() + items[i]["text_tokens"].numel()
+                      for i in train_indices]
+        val_lens = [items[i]["speech_tokens"].numel() + items[i]["text_tokens"].numel()
+                    for i in val_indices]
+        train_sampler = LengthBucketSampler(train_lens, args.batch_size, shuffle=True, seed=args.seed)
+        val_sampler = LengthBucketSampler(val_lens, args.batch_size, shuffle=False)
+        pad_waste = 1 - (sum(train_lens) / len(train_lens)) / max(
+            1, max(train_lens))
+        print(f"Length bucketing ON (batch {args.batch_size}): clip lengths "
+              f"{min(train_lens)}-{max(train_lens)} tokens, mean "
+              f"{sum(train_lens) / len(train_lens):.0f}. Without bucketing every batch "
+              f"would pad toward the max ({pad_waste:.0%} waste worst case).")
+        train_loader = DataLoader(train_subset, batch_sampler=train_sampler, **loader_kwargs)
+        val_loader = DataLoader(val_subset, batch_sampler=val_sampler, **loader_kwargs)
+    else:
+        train_loader = DataLoader(train_subset, batch_size=args.batch_size, shuffle=True, **loader_kwargs)
+        val_loader = DataLoader(val_subset, batch_size=args.batch_size, shuffle=False, **loader_kwargs)
+
     param_groups = build_param_groups(model, args)
     optimizer = torch.optim.AdamW(param_groups, foreach=False)
     steps_per_epoch = max(1, math.ceil(len(train_loader) / args.grad_accum_steps))
     scheduler = build_scheduler(args, optimizer, steps_per_epoch) if not args.dry_run else None
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=needs_scaler)
 
     run_state = RunState(train_indices=train_indices, val_indices=val_indices)
     if resumed_payload is not None:
@@ -805,7 +971,7 @@ def main():
             scheduler.load_state_dict(resumed_payload["scheduler_state_dict"])
         # Restoring the GradScaler keeps the AMP loss scale warm; without it the
         # first few steps after a resume can be skipped while it re-calibrates.
-        if use_amp and resumed_payload.get("scaler_state_dict") is not None:
+        if needs_scaler and resumed_payload.get("scaler_state_dict") is not None:
             scaler.load_state_dict(resumed_payload["scaler_state_dict"])
         if args.max_epochs is not None and run_state.epoch >= args.max_epochs:
             raise RuntimeError(
@@ -822,9 +988,21 @@ def main():
 
     if args.dry_run:
         print("\n=== DRY RUN ===")
-        batch = move_batch_to_device(next(iter(train_loader)), device)
+        # Peak memory is set by the LONGEST batch, not a random one. Benchmarking
+        # an average batch is exactly what hid a real OOM until 1250 steps into a
+        # multi-hour run, so build the worst case on purpose.
+        worst = sorted(
+            train_indices,
+            key=lambda i: items[i]["speech_tokens"].numel() + items[i]["text_tokens"].numel(),
+            reverse=True,
+        )[:args.batch_size]
+        batch = move_batch_to_device(collate_batch([items[i] for i in worst]), device)
+        print(f"Worst-case batch: {len(worst)} longest clips -> "
+              f"{int(batch['speech_tokens'].size(1))} speech + "
+              f"{int(batch['text_tokens'].size(1))} text tokens (padded).")
         optimizer.zero_grad(set_to_none=True)
-        autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.float16) if use_amp else nullcontext()
+        autocast_ctx = (torch.autocast(device_type="cuda", dtype=amp_dtype)
+                        if use_amp else nullcontext())
         with autocast_ctx:
             loss_text, loss_speech, loss_total = compute_batch_losses(model, batch, reference_cond_t3, args.text_loss_weight)
         print(f"Dry run loss_text: {loss_text.item():.6f}")
@@ -833,7 +1011,7 @@ def main():
         if not torch.isfinite(loss_total):
             raise RuntimeError("Dry-run loss is not finite.")
 
-        if use_amp:
+        if needs_scaler:
             scaler.scale(loss_total).backward()
             scaler.unscale_(optimizer)
         else:
@@ -842,7 +1020,7 @@ def main():
         grad_params, grads_finite = grad_finite_check(model)
         print(f"Dry run params with grads: {grad_params}")
         print(f"Dry run gradients finite: {grads_finite}")
-        if not grads_finite and use_amp:
+        if not grads_finite and needs_scaler:
             # GradScaler starts at a loss scale of 65536 and deliberately
             # overflows-then-halves on the first steps; run_epoch lets it skip
             # those. So an fp16 overflow here is calibration, not breakage.
@@ -862,7 +1040,7 @@ def main():
         if not grads_finite:
             raise RuntimeError("Dry-run gradients are not finite.")
 
-        if use_amp:
+        if needs_scaler:
             scaler.step(optimizer)
             scaler.update()
         else:
@@ -881,9 +1059,12 @@ def main():
             torch.cuda.reset_peak_memory_stats()
 
         print(f"\n=== Epoch {epoch}/{args.max_epochs} ===")
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         train_metrics = run_epoch(
-            model, train_loader, optimizer, scaler if use_amp else None, device,
+            model, train_loader, optimizer, scaler if needs_scaler else None, device,
             reference_cond_t3, max(1, args.grad_accum_steps), True, scheduler, args.text_loss_weight,
+            amp_dtype=amp_dtype, max_grad_norm=args.max_grad_norm,
         )
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -891,6 +1072,7 @@ def main():
         val_metrics = run_epoch(
             model, val_loader, None, None, device,
             reference_cond_t3, 1, False, None, args.text_loss_weight,
+            amp_dtype=amp_dtype,
         )
 
         epoch_duration = time.perf_counter() - epoch_start

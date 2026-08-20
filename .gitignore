@@ -71,3 +71,7 @@ token_cache.pt
 
 # Ignore generated sample .wav files
 **/*.wav
+
+# Training data extracted into the repo (18GB+ -- never commit)
+data/
+!data/.gitkeep

@@ -12,6 +12,11 @@
 
 **Chatterbox** is a family of state-of-the-art, open-source text-to-speech models by Resemble AI.
 
+> **This fork:** Hindi fine-tuning of Chatterbox Nano's T3 model — full/LoRA training on the
+> Vaani corpus (166.77 h, 81,951 clips, 20,223 speakers), with multi-speaker conditioning and
+> verified cross-lingual voice cloning. See **[NANO_HINDI_FINETUNE.md](./NANO_HINDI_FINETUNE.md)**.
+
+
 ## Latest Release: Chatterbox Multilingual V3
 
 **Chatterbox Multilingual V3** is the latest general-purpose multilingual TTS model in the Chatterbox family. It keeps the same 0.5B model size while improving speaker similarity, reducing hallucinations, and producing more natural, conversational speech across languages.
