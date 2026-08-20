@@ -47,6 +47,7 @@ from peft import LoraConfig, PeftModel, get_peft_model
 import chatterbox.models.t3.t3 as t3_module
 from chatterbox.tts_turbo import ChatterboxTurboTTS, punc_norm
 from chatterbox.models.s3gen.const import S3GEN_SIL
+from chatterbox.models.t3.modules.cond_enc import T3Cond
 
 # T3.forward() asserts that start/stop text tokens (255 / 0) are present, but
 # those ids are from the legacy EnTokenizer vocab. Nano inference never uses
@@ -126,14 +127,19 @@ def to_mono_resampled(wav: torch.Tensor, sr: int, target_sr: int = TARGET_SR) ->
 # Token cache
 # ---------------------------------------------------------------------------
 
-def build_or_load_token_cache(cache_path: Path, rows: list[tuple[Path, str]], model: ChatterboxTurboTTS):
-    """Tokenize the whole manifest once (text + S3 speech tokens) and cache to disk."""
+def build_or_load_token_cache(cache_path: Path, rows: list[tuple[Path, str]], model: ChatterboxTurboTTS,
+                              multi_speaker: bool = False):
+    """Tokenize the whole manifest once (text + S3 speech tokens) and cache to disk.
+
+    In multi-speaker mode a voice-encoder embedding is also computed per clip, so
+    every training example can be conditioned on its OWN speaker.
+    """
     if cache_path.exists():
         payload = torch.load(cache_path, map_location="cpu", weights_only=False)
-        if payload.get("num_rows") == len(rows):
-            print(f"Loaded token cache: {cache_path} ({len(rows)} rows)")
+        if payload.get("num_rows") == len(rows) and payload.get("multi_speaker", False) == multi_speaker:
+            print(f"Loaded token cache: {cache_path} ({len(rows)} rows, multi_speaker={multi_speaker})")
             return payload["items"]
-        print("Token cache row count mismatch; rebuilding.")
+        print("Token cache mismatch (row count or speaker mode); rebuilding.")
 
     hp = model.t3.hp
     items = []
@@ -170,17 +176,25 @@ def build_or_load_token_cache(cache_path: Path, rows: list[tuple[Path, str]], mo
         if speech_tokens.numel() > hp.max_speech_tokens:
             raise ValueError(f"Row {idx}: speech sequence exceeds max_speech_tokens.")
 
-        items.append({
+        item = {
             "audio_path": str(audio_path),
             "transcript": transcript,
             "text_tokens": text_tokens,
             "speech_tokens": speech_tokens,
-        })
+        }
+        if multi_speaker:
+            # 256-d voice-encoder embedding of this clip. It encodes speaker
+            # identity, not content, so deriving it from the target audio is
+            # safe -- unlike a speech cond prompt, which would leak the answer.
+            with torch.no_grad():
+                ve_embed = model.ve.embeds_from_wavs([wav.squeeze(0).numpy()], sample_rate=TARGET_SR)
+            item["speaker_emb"] = torch.from_numpy(ve_embed).float().mean(dim=0)
+        items.append(item)
         if (idx + 1) % 50 == 0 or (idx + 1) == len(rows):
             print(f"  tokenized {idx + 1}/{len(rows)}")
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"num_rows": len(rows), "items": items}, cache_path)
+    torch.save({"num_rows": len(rows), "items": items, "multi_speaker": multi_speaker}, cache_path)
     print(f"Token cache built in {time.perf_counter() - start:.1f}s -> {cache_path}")
     return items
 
@@ -207,12 +221,15 @@ def collate_batch(batch):
         [item["speech_tokens"] for item in batch], batch_first=True, padding_value=SPEECH_PAD
     )
 
-    return {
+    out = {
         "text_tokens": text_tokens,
         "text_lens": text_lens,
         "speech_tokens": speech_tokens,
         "speech_lens": speech_lens,
     }
+    if "speaker_emb" in batch[0]:
+        out["speaker_emb"] = torch.stack([item["speaker_emb"] for item in batch])
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +361,29 @@ def shifted_masked_ce(logits: torch.Tensor, tokens: torch.Tensor, lens: torch.Te
     return F.cross_entropy(logits.transpose(1, 2), targets, ignore_index=IGNORE_ID)
 
 
+def batch_t3_cond(batch, base_cond):
+    """Conditioning for this batch.
+
+    With a per-clip speaker embedding we must NOT reuse the single fixed
+    reference: telling the model "this is speaker A" while asking it to predict
+    speaker B teaches it to ignore speaker conditioning entirely.
+
+    The speech cond prompt is left empty on purpose. hp.speech_cond_prompt_len
+    is 375 tokens (15s), longer than most clips, so prompting a clip with its
+    own audio would hand the model the very tokens it must predict.
+    """
+    if "speaker_emb" not in batch:
+        return base_cond
+    return T3Cond(
+        speaker_emb=batch["speaker_emb"],
+        cond_prompt_speech_tokens=None,
+        cond_prompt_speech_emb=None,
+        emotion_adv=None,
+    )
+
+
 def compute_batch_losses(model: ChatterboxTurboTTS, batch, t3_cond, text_loss_weight: float):
+    t3_cond = batch_t3_cond(batch, t3_cond)
     out = model.t3.forward(
         t3_cond=t3_cond,
         text_tokens=batch["text_tokens"],
@@ -504,6 +543,7 @@ def run_epoch(model, loader, optimizer, scaler, device, t3_cond, grad_accum_step
 
     total_text = total_speech = total_loss = 0.0
     batch_count = 0
+    oom_skipped = 0
 
     if train:
         model.t3.train()
@@ -516,10 +556,23 @@ def run_epoch(model, loader, optimizer, scaler, device, t3_cond, grad_accum_step
             print(f"{'train' if train else 'val'} batch {step_idx + 1}/{len(loader)}")
         batch = move_batch_to_device(batch, device)
 
-        with grad_ctx:
-            with autocast_ctx:
-                loss_text, loss_speech, loss_total = compute_batch_losses(model, batch, t3_cond, text_loss_weight)
-                scaled_loss = loss_total / grad_accum_steps if train else loss_total
+        try:
+            with grad_ctx:
+                with autocast_ctx:
+                    loss_text, loss_speech, loss_total = compute_batch_losses(model, batch, t3_cond, text_loss_weight)
+                    scaled_loss = loss_total / grad_accum_steps if train else loss_total
+        except torch.cuda.OutOfMemoryError:
+            # A single unlucky long sequence must not kill a multi-hour run.
+            # Drop this batch, reclaim its memory, and carry on. Accumulated
+            # gradients from earlier micro-batches stay valid.
+            oom_skipped += 1
+            print(f"  CUDA OOM on batch {step_idx + 1} -- skipping it "
+                  f"(seq len {int(batch['speech_tokens'].size(1))}+{int(batch['text_tokens'].size(1))}). "
+                  f"total skipped: {oom_skipped}")
+            del batch
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            continue
 
         total_text += float(loss_text.detach())
         total_speech += float(loss_speech.detach())
@@ -558,7 +611,10 @@ def run_epoch(model, loader, optimizer, scaler, device, t3_cond, grad_accum_step
             del scaled_loss
 
     denom = max(1, batch_count)
-    return {"text": total_text / denom, "speech": total_speech / denom, "total": total_loss / denom}
+    if oom_skipped:
+        print(f"  NOTE: {oom_skipped} batch(es) skipped this pass due to CUDA OOM.")
+    return {"text": total_text / denom, "speech": total_speech / denom,
+            "total": total_loss / denom, "oom_skipped": oom_skipped}
 
 
 def build_scheduler(args, optimizer, steps_per_epoch: int):
@@ -608,6 +664,10 @@ def parse_args():
     parser.add_argument("--lora-dropout", type=float, default=0.05)
     parser.add_argument("--lora-targets", type=str, default="c_attn,c_proj,c_fc")
     parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--multi-speaker", action=argparse.BooleanOptionalAction, default=False,
+                        help="Condition each clip on its own voice embedding. Required for "
+                             "multi-speaker corpora; a single fixed reference would teach the "
+                             "model to ignore speaker conditioning.")
     return parser.parse_args()
 
 
@@ -683,7 +743,7 @@ def main():
     model = build_nano_model(args, device)
     trainable_count = check_sanity(model, args)
 
-    items = build_or_load_token_cache(args.token_cache, rows, model)
+    items = build_or_load_token_cache(args.token_cache, rows, model, multi_speaker=args.multi_speaker)
 
     # Report which text token ids the dataset actually uses.
     used_ids = set()
@@ -696,6 +756,11 @@ def main():
         model.prepare_conditionals(str(args.reference_audio), exaggeration=0.0, norm_loudness=True)
     reference_cond = copy.deepcopy(model.conds)
     reference_cond_t3 = copy.deepcopy(reference_cond.t3).to(device=device)
+
+    if args.multi_speaker:
+        n_spk = sum(1 for it in items if "speaker_emb" in it)
+        print(f"Multi-speaker conditioning ON: {n_spk}/{len(items)} clips have a voice embedding.")
+        print("Speech cond prompt is disabled during training (see batch_t3_cond).")
 
     # Free what we no longer need to keep RAM in check.
     model.ve = None
@@ -777,6 +842,23 @@ def main():
         grad_params, grads_finite = grad_finite_check(model)
         print(f"Dry run params with grads: {grad_params}")
         print(f"Dry run gradients finite: {grads_finite}")
+        if not grads_finite and use_amp:
+            # GradScaler starts at a loss scale of 65536 and deliberately
+            # overflows-then-halves on the first steps; run_epoch lets it skip
+            # those. So an fp16 overflow here is calibration, not breakage.
+            # Re-check in fp32 to tell the two apart.
+            print("Non-finite under fp16 -- re-checking in fp32 to distinguish "
+                  "AMP calibration from a real problem...")
+            optimizer.zero_grad(set_to_none=True)
+            loss_text, loss_speech, loss_total = compute_batch_losses(
+                model, batch, reference_cond_t3, args.text_loss_weight)
+            loss_total.backward()
+            grad_params, grads_finite = grad_finite_check(model)
+            print(f"Dry run fp32 gradients finite: {grads_finite}")
+            if grads_finite:
+                print("OK: gradients are finite in fp32, so this is normal AMP "
+                      "loss-scale calibration. GradScaler will skip those steps.")
+            optimizer.zero_grad(set_to_none=True)
         if not grads_finite:
             raise RuntimeError("Dry-run gradients are not finite.")
 
@@ -828,6 +910,8 @@ def main():
             "val_total_loss": val_metrics["total"],
             "epoch_duration_sec": epoch_duration,
             "trainable_params": trainable_count,
+            "train_oom_skipped": train_metrics.get("oom_skipped", 0),
+            "val_oom_skipped": val_metrics.get("oom_skipped", 0),
         }
         append_metrics_log(args.output_dir, epoch_metrics)
 

@@ -33,6 +33,9 @@ def parse_args():
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--top-k", type=int, default=1000)
     parser.add_argument("--max-new-tokens", type=int, default=300, help="Caps generation to avoid runaway/OOM.")
+    parser.add_argument("--multi-speaker", action="store_true",
+                        help="Match a --multi-speaker training run: condition on the reference's\n"
+                             "voice embedding only, with no speech cond prompt.")
     return parser.parse_args()
 
 
@@ -62,6 +65,14 @@ def main():
 
     with torch.no_grad():
         model.prepare_conditionals(str(args.reference_audio), exaggeration=0.0, norm_loudness=True)
+
+    if args.multi_speaker:
+        # Training conditioned on speaker_emb alone, so inference must too --
+        # otherwise the model sees a 375-token cond prompt it never saw in training.
+        model.conds.t3.cond_prompt_speech_tokens = None
+        model.conds.t3.cond_prompt_speech_emb = None
+        model.conds.t3.emotion_adv = None
+        print("Multi-speaker mode: speech cond prompt disabled (matches training).")
 
     for idx, text in enumerate(args.text, start=1):
         print(f"\nGenerating {idx}/{len(args.text)}: {text}")

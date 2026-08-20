@@ -152,6 +152,60 @@ Do **not** swap in the multilingual model's 2454-token tokenizer: it occupies a 
 space than Nano's `text_emb` / `text_head`, so it would require reinitializing and
 retraining both from scratch.
 
+## Training on the Vaani corpus (multi-speaker)
+
+`/home/aryan/Desktop/vaani_hindi_dataset/` holds **Vaani** (IISc/Google): 39 parquet
+shards, 18 GB, ~82k rows. It is an **ASR** corpus of spontaneous field recordings, not a
+TTS corpus, so most of it is unusable as-is. Measured per shard:
+
+| Problem | Share |
+| --- | --- |
+| Noise-tagged (`<noise>`, `<static_noise>`, `<horn>`, `<people_talking>`) | 31% |
+| Truncated mid-word (trailing `--`) | 29% |
+| Not pure Hindi (Bhojpuri / Chhattisgarhi / Maithili / Magahi dialects) | 21% |
+| `[unintelligible]` | 5% |
+
+Transcripts also carry annotation markup and `{brace}` spans that are *either* a Devanagari
+spelling correction (use it, drop the word before) *or* an English gloss (drop it, keep the
+Hindi). `prepare_vaani_dataset.py` handles all of this:
+
+```bash
+python prepare_vaani_dataset.py --target-hours 20
+```
+
+Keep rate is ~19%. The 20 h run produced **10,069 clips / 6,189 speakers / mean 7.15 s**
+(2.2 GB) plus a manifest in the usual `audio_path|transcript` format.
+
+### Why `--multi-speaker` is mandatory here
+
+Conditioning was previously built **once** from a single reference file and reused for every
+example. That is correct for a single-speaker corpus and actively harmful across 6k
+speakers: the model is told "this is speaker A" while being asked to predict speaker B, so
+it learns to ignore speaker conditioning altogether and voice cloning degrades.
+
+`--multi-speaker` instead gives every clip its own 256-d voice-encoder embedding, computed
+once at tokenization time and cached alongside the tokens.
+
+**The speech cond prompt is deliberately disabled in this mode.** `speech_cond_prompt_len`
+is 375 tokens (15 s), longer than most clips, so prompting a clip with its own audio would
+hand the model the exact tokens it must predict — it would learn to copy the prompt and
+ignore the text. Prompting from a *different* clip by the same speaker isn't an option
+either: Vaani averages ~1.27 clips per speaker. VALL-E-style prefix prompting would need the
+text trimmed to match the audio suffix, and there's no word-level alignment. So the model
+conditions on the speaker embedding alone, which carries identity rather than content and
+therefore leaks nothing.
+
+`infer_nano_exp1.py --multi-speaker` nulls the same fields so inference matches training.
+
+Verified: embeddings are distinct per clip (cosine 0.65-0.78 across speakers), and speech
+loss orders correctly — correct speaker 8.0098 < wrong speaker 8.0467 < zeros 8.0559 —
+confirming the conditioning path is live rather than ignored.
+
+### Measured cost on a 4GB card
+
+Worst case (15 s clips): batch 1 = 1537 MB, batch 2 = 1804 MB, batch 4 = 2043 MB peak. All
+fit. Token cache build is ~0.235 s/clip, so ~40 min one-time for 10k clips.
+
 ### Next step
 
 More data. Rough estimate: **~20-50h for first recognizable words, ~50-150h for fluency.**
